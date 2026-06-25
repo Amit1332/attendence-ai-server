@@ -1,7 +1,9 @@
 "use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
+var __importDefault =
+  (this && this.__importDefault) ||
+  function (mod) {
+    return mod && mod.__esModule ? mod : { default: mod };
+  };
 Object.defineProperty(exports, "__esModule", { value: true });
 const openai_1 = require("openai");
 const pdf_parse_1 = require("pdf-parse");
@@ -13,363 +15,489 @@ const prisma_1 = __importDefault(require("../config/prisma"));
 const aiSettings_1 = require("../utils/aiSettings");
 // Get AI Client depending on selected provider in settings
 const getAIClient = () => {
-    const settings = (0, aiSettings_1.getAISettings)();
-    const provider = settings.provider || "OPENAI";
-    if (provider === "GROQ") {
-        const groqKey = settings.groqApiKey || process.env.GROQ_API_KEY || "";
-        if (!groqKey) {
-            throw new ApiError_1.default(http_status_codes_1.HTTP_STATUS_CODES.INTERNAL_SERVER_ERROR, "Groq API key is not configured. Please set GROQ_API_KEY in the Settings or .env file.");
-        }
-        return {
-            client: new openai_1.OpenAI({
-                apiKey: groqKey,
-                baseURL: "https://api.groq.com/openai/v1",
-            }),
-            modelName: "llama-3.3-70b-versatile",
-        };
+  const settings = (0, aiSettings_1.getAISettings)();
+  const provider = settings.provider || "OPENAI";
+  if (provider === "GROQ") {
+    const groqKey = settings.groqApiKey || process.env.GROQ_API_KEY || "";
+    if (!groqKey) {
+      throw new ApiError_1.default(
+        http_status_codes_1.HTTP_STATUS_CODES.INTERNAL_SERVER_ERROR,
+        "Groq API key is not configured. Please set GROQ_API_KEY in the Settings or .env file.",
+      );
     }
-    else {
-        // Default: OpenAI
-        const openAIKey = settings.openaiApiKey || config_1.default.openaiApiKey || process.env.OPENAI_API_KEY || "";
-        if (!openAIKey || openAIKey === "your-openai-api-key-here") {
-            throw new ApiError_1.default(http_status_codes_1.HTTP_STATUS_CODES.INTERNAL_SERVER_ERROR, "OpenAI API key is not configured. Please set OPENAI_API_KEY in the Settings or .env file.");
-        }
-        return {
-            client: new openai_1.OpenAI({
-                apiKey: openAIKey,
-            }),
-            modelName: "gpt-4o-mini",
-        };
+    return {
+      client: new openai_1.OpenAI({
+        apiKey: groqKey,
+        baseURL: "https://api.groq.com/openai/v1",
+      }),
+      modelName: "llama-3.3-70b-versatile",
+    };
+  } else {
+    // Default: OpenAI
+    const openAIKey =
+      settings.openaiApiKey ||
+      config_1.default.openaiApiKey ||
+      process.env.OPENAI_API_KEY ||
+      "";
+    if (!openAIKey || openAIKey === "your-openai-api-key-here") {
+      throw new ApiError_1.default(
+        http_status_codes_1.HTTP_STATUS_CODES.INTERNAL_SERVER_ERROR,
+        "OpenAI API key is not configured. Please set OPENAI_API_KEY in the Settings or .env file.",
+      );
     }
+    return {
+      client: new openai_1.OpenAI({
+        apiKey: openAIKey,
+      }),
+      modelName: "gpt-4o-mini",
+    };
+  }
 };
 class AIService {
-    /**
-     * Helper to ensure the pgvector extension is created in the database
-     */
-    async ensureVectorExtension() {
-        try {
-            await prisma_1.default.$executeRawUnsafe(`CREATE EXTENSION IF NOT EXISTS vector;`);
-        }
-        catch (error) {
-            console.warn("Failed to check/create vector extension, it might already exist or permission is denied.", error);
-        }
+  /**
+   * Helper to ensure the pgvector extension is created in the database
+   */
+  async ensureVectorExtension() {
+    try {
+      await prisma_1.default.$executeRawUnsafe(
+        `CREATE EXTENSION IF NOT EXISTS vector;`,
+      );
+    } catch (error) {
+      console.warn(
+        "Failed to check/create vector extension, it might already exist or permission is denied.",
+        error,
+      );
     }
-    /**
-     * Generate vector embedding for a given text
-     */
-    async generateEmbedding(text) {
-        const settings = (0, aiSettings_1.getAISettings)();
-        const openAIKey = settings.openaiApiKey || config_1.default.openaiApiKey || process.env.OPENAI_API_KEY || "";
-        // Use OpenAI embeddings if API key is present, even if Grok is selected as LLM
-        if (openAIKey && openAIKey !== "your-openai-api-key-here") {
-            try {
-                const openai = new openai_1.OpenAI({ apiKey: openAIKey });
-                const response = await openai.embeddings.create({
-                    model: "text-embedding-3-small",
-                    input: text.replace(/\n/g, " "),
-                });
-                return response.data[0].embedding;
-            }
-            catch (error) {
-                console.warn("OpenAI embedding generation failed, falling back to local hashing", error);
-            }
-        }
-        // Fallback: Hashing trick projects text to unit vector in 1536-dimensional space (entirely free and local!)
-        return (0, aiSettings_1.generateLocalEmbedding)(text);
-    }
-    /**
-     * Process and index a company document (RAG pipeline)
-     */
-    async uploadDocument(userId, title, documentType, fileBuffer, fileName) {
-        await this.ensureVectorExtension();
-        // Extract text from PDF buffer
-        let pdfText = "";
-        let parser = null;
-        try {
-            parser = new pdf_parse_1.PDFParse({ data: new Uint8Array(fileBuffer) });
-            const data = await parser.getText();
-            pdfText = data.text;
-        }
-        catch (error) {
-            throw new ApiError_1.default(http_status_codes_1.HTTP_STATUS_CODES.BAD_REQUEST, `Failed to extract text from PDF: ${error.message}`);
-        }
-        finally {
-            if (parser) {
-                await parser.destroy();
-            }
-        }
-        if (!pdfText || pdfText.trim().length === 0) {
-            throw new ApiError_1.default(http_status_codes_1.HTTP_STATUS_CODES.BAD_REQUEST, "PDF file is empty or no extractable text found.");
-        }
-        // Save document details
-        const document = await prisma_1.default.document.create({
-            data: {
-                title,
-                fileName,
-                documentType,
-                uploadedById: userId,
-            },
+  }
+  /**
+   * Generate vector embedding for a given text
+   */
+  async generateEmbedding(text) {
+    const settings = (0, aiSettings_1.getAISettings)();
+    const openAIKey =
+      settings.openaiApiKey ||
+      config_1.default.openaiApiKey ||
+      process.env.OPENAI_API_KEY ||
+      "";
+    // Use OpenAI embeddings if API key is present, even if Grok is selected as LLM
+    if (openAIKey && openAIKey !== "your-openai-api-key-here") {
+      try {
+        const openai = new openai_1.OpenAI({ apiKey: openAIKey });
+        const response = await openai.embeddings.create({
+          model: "text-embedding-3-small",
+          input: text.replace(/\n/g, " "),
         });
-        // Chunk text: ~800 characters with 100 character overlap
-        const chunkSize = 800;
-        const overlap = 100;
-        const chunks = [];
-        let index = 0;
-        while (index < pdfText.length) {
-            const chunk = pdfText.substring(index, index + chunkSize).trim();
-            if (chunk.length > 0) {
-                chunks.push(chunk);
-            }
-            index += chunkSize - overlap;
-        }
-        // Process and insert chunks
-        for (const chunkContent of chunks) {
-            const embedding = await this.generateEmbedding(chunkContent);
-            const chunkId = crypto_1.default.randomUUID();
-            // Insert chunk content and vector embedding using raw query
-            await prisma_1.default.$executeRawUnsafe(`INSERT INTO "DocumentChunk" (id, "documentId", content, embedding) VALUES ($1, $2, $3, $4::vector)`, chunkId, document.id, chunkContent, `[${embedding.join(",")}]`);
-        }
-        return document;
+        return response.data[0].embedding;
+      } catch (error) {
+        console.warn(
+          "OpenAI embedding generation failed, falling back to local hashing",
+          error,
+        );
+      }
     }
-    /**
-     * Helper to re-rank chunks using keyword overlap and rule-based HR stemmer
-     */
-    reRankChunks(question, matchedChunks) {
-        const queryWords = question.toLowerCase().match(/\w+/g) || [];
-        const queryStems = new Set(queryWords.map((w) => (0, aiSettings_1.stem)(w)).filter((w) => !aiSettings_1.stopwords.has(w)));
-        const scored = matchedChunks.map(chunk => {
-            const docWords = chunk.content.toLowerCase().match(/\w+/g) || [];
-            const docStems = docWords.map((w) => (0, aiSettings_1.stem)(w)).filter((w) => !aiSettings_1.stopwords.has(w));
-            const docStemsSet = new Set(docStems);
-            let uniqueMatches = 0;
-            queryStems.forEach((w) => {
-                if (docStemsSet.has(w)) {
-                    uniqueMatches++;
-                }
-            });
-            let termFreqScore = 0;
-            queryStems.forEach((qw) => {
-                const count = docStems.filter((dw) => dw === qw).length;
-                termFreqScore += Math.min(count, 3);
-            });
-            const coverage = queryStems.size > 0 ? (uniqueMatches / queryStems.size) : 0;
-            const coverageBoost = coverage === 1.0 ? 2.0 : (coverage >= 0.5 ? 0.5 : 0.0);
-            // Final hybrid score combining cosine similarity and keyword relevance
-            const keywordMatchScore = (uniqueMatches * 1.5) + (termFreqScore * 0.1) + coverageBoost;
-            const finalScore = chunk.similarity + keywordMatchScore;
-            return {
-                ...chunk,
-                finalScore
-            };
+    // Fallback: Hashing trick projects text to unit vector in 1536-dimensional space (entirely free and local!)
+    return (0, aiSettings_1.generateLocalEmbedding)(text);
+  }
+  /**
+   * Process and index a company document (RAG pipeline)
+   */
+  async uploadDocument(userId, title, documentType, fileBuffer, fileName) {
+    await this.ensureVectorExtension();
+    // Extract text from PDF buffer
+    let pdfText = "";
+    let parser = null;
+    try {
+      parser = new pdf_parse_1.PDFParse({ data: new Uint8Array(fileBuffer) });
+      const data = await parser.getText();
+      pdfText = data.text;
+    } catch (error) {
+      throw new ApiError_1.default(
+        http_status_codes_1.HTTP_STATUS_CODES.BAD_REQUEST,
+        `Failed to extract text from PDF: ${error.message}`,
+      );
+    } finally {
+      if (parser) {
+        await parser.destroy();
+      }
+    }
+    if (!pdfText || pdfText.trim().length === 0) {
+      throw new ApiError_1.default(
+        http_status_codes_1.HTTP_STATUS_CODES.BAD_REQUEST,
+        "PDF file is empty or no extractable text found.",
+      );
+    }
+    // Save document details
+    const document = await prisma_1.default.document.create({
+      data: {
+        title,
+        fileName,
+        documentType,
+        uploadedById: userId,
+      },
+    });
+    // Chunk text: ~800 characters with 100 character overlap
+    const chunkSize = 800;
+    const overlap = 100;
+    const chunks = [];
+    let index = 0;
+    while (index < pdfText.length) {
+      const chunk = pdfText.substring(index, index + chunkSize).trim();
+      if (chunk.length > 0) {
+        chunks.push(chunk);
+      }
+      index += chunkSize - overlap;
+    }
+    // Process and insert chunks
+    for (const chunkContent of chunks) {
+      const embedding = await this.generateEmbedding(chunkContent);
+      const chunkId = crypto_1.default.randomUUID();
+      // Insert chunk content and vector embedding using raw query
+      await prisma_1.default.$executeRawUnsafe(
+        `INSERT INTO "DocumentChunk" (id, "documentId", content, embedding) VALUES ($1, $2, $3, $4::vector)`,
+        chunkId,
+        document.id,
+        chunkContent,
+        `[${embedding.join(",")}]`,
+      );
+    }
+    return document;
+  }
+  /**
+   * Helper to re-rank chunks using keyword overlap and rule-based HR stemmer
+   */
+  reRankChunks(question, matchedChunks) {
+    const queryWords = question.toLowerCase().match(/\w+/g) || [];
+    const queryStems = new Set(
+      queryWords
+        .map((w) => (0, aiSettings_1.stem)(w))
+        .filter((w) => !aiSettings_1.stopwords.has(w)),
+    );
+    const scored = matchedChunks.map((chunk) => {
+      const docWords = chunk.content.toLowerCase().match(/\w+/g) || [];
+      const docStems = docWords
+        .map((w) => (0, aiSettings_1.stem)(w))
+        .filter((w) => !aiSettings_1.stopwords.has(w));
+      const docStemsSet = new Set(docStems);
+      let uniqueMatches = 0;
+      queryStems.forEach((w) => {
+        if (docStemsSet.has(w)) {
+          uniqueMatches++;
+        }
+      });
+      let termFreqScore = 0;
+      queryStems.forEach((qw) => {
+        const count = docStems.filter((dw) => dw === qw).length;
+        termFreqScore += Math.min(count, 3);
+      });
+      const coverage =
+        queryStems.size > 0 ? uniqueMatches / queryStems.size : 0;
+      const coverageBoost =
+        coverage === 1.0 ? 2.0 : coverage >= 0.5 ? 0.5 : 0.0;
+      // Final hybrid score combining cosine similarity and keyword relevance
+      const keywordMatchScore =
+        uniqueMatches * 1.5 + termFreqScore * 0.1 + coverageBoost;
+      const finalScore = chunk.similarity + keywordMatchScore;
+      return {
+        ...chunk,
+        finalScore,
+      };
+    });
+    // Sort by finalScore descending
+    scored.sort((a, b) => b.finalScore - a.finalScore);
+    return scored;
+  }
+  /**
+   * Retrieve relevant chunks using hybrid search (vector similarity + keyword re-ranking)
+   * with a fallback to the policy overview (first 6 chunks of the document) if no topic matches.
+   */
+  async retrieveRelevantChunks(question, matchedChunks) {
+    const reRanked = this.reRankChunks(question, matchedChunks);
+    let topChunks = reRanked.slice(0, 6);
+    // If the top chunk has no keyword match (meaning we only matched common stopwords, or the query is very general),
+    // we fall back to the first 6 chunks of the document (which contain the overview / Table of Contents).
+    const hasKeywordMatch =
+      reRanked.length > 0 &&
+      reRanked[0].finalScore - reRanked[0].similarity >= 1.0;
+    if (!hasKeywordMatch) {
+      try {
+        const fallbackChunks = await prisma_1.default.documentChunk.findMany({
+          take: 6,
+          orderBy: {
+            createdAt: "asc",
+          },
+          include: {
+            document: true,
+          },
         });
-        // Sort by finalScore descending
-        scored.sort((a, b) => b.finalScore - a.finalScore);
-        return scored;
-    }
-    /**
-     * Retrieve relevant chunks using hybrid search (vector similarity + keyword re-ranking)
-     * with a fallback to the policy overview (first 6 chunks of the document) if no topic matches.
-     */
-    async retrieveRelevantChunks(question, matchedChunks) {
-        const reRanked = this.reRankChunks(question, matchedChunks);
-        let topChunks = reRanked.slice(0, 6);
-        // If the top chunk has no keyword match (meaning we only matched common stopwords, or the query is very general),
-        // we fall back to the first 6 chunks of the document (which contain the overview / Table of Contents).
-        const hasKeywordMatch = reRanked.length > 0 && (reRanked[0].finalScore - reRanked[0].similarity >= 1.0);
-        if (!hasKeywordMatch) {
-            try {
-                const fallbackChunks = await prisma_1.default.documentChunk.findMany({
-                    take: 6,
-                    orderBy: {
-                        createdAt: "asc"
-                    },
-                    include: {
-                        document: true
-                    }
-                });
-                if (fallbackChunks.length > 0) {
-                    topChunks = fallbackChunks.map(c => ({
-                        content: c.content,
-                        title: c.document.title,
-                        documentType: c.document.documentType,
-                        similarity: 0.1,
-                        finalScore: 0.1
-                    }));
-                }
-            }
-            catch (err) {
-                console.warn("Failed to retrieve fallback overview chunks:", err);
-            }
+        if (fallbackChunks.length > 0) {
+          topChunks = fallbackChunks.map((c) => ({
+            content: c.content,
+            title: c.document.title,
+            documentType: c.document.documentType,
+            similarity: 0.1,
+            finalScore: 0.1,
+          }));
         }
-        return topChunks;
+      } catch (err) {
+        console.warn("Failed to retrieve fallback overview chunks:", err);
+      }
     }
-    /**
-     * Answer questions about company policies using RAG
-     */
-    async askPolicyQuestion(question) {
-        await this.ensureVectorExtension();
-        const { client, modelName } = getAIClient();
-        // 1. Embed query
-        const questionEmbedding = await this.generateEmbedding(question);
-        // 2. Query nearest chunks (retrieve more candidates for hybrid re-ranking)
-        const formattedVector = `[${questionEmbedding.join(",")}]`;
-        const matchedChunks = await prisma_1.default.$queryRawUnsafe(`SELECT c.content, d.title, d."documentType", 1 - (c.embedding <=> $1::vector) AS similarity
+    return topChunks;
+  }
+  /**
+   * Answer questions about company policies using RAG
+   */
+  async askPolicyQuestion(question) {
+    await this.ensureVectorExtension();
+    const { client, modelName } = getAIClient();
+    // 1. Embed query
+    const questionEmbedding = await this.generateEmbedding(question);
+    // 2. Query nearest chunks (retrieve more candidates for hybrid re-ranking)
+    const formattedVector = `[${questionEmbedding.join(",")}]`;
+    const matchedChunks = await prisma_1.default.$queryRawUnsafe(
+      `SELECT c.content, d.title, d."documentType", 1 - (c.embedding <=> $1::vector) AS similarity
        FROM "DocumentChunk" c
        JOIN "Document" d ON c."documentId" = d.id
        ORDER BY c.embedding <=> $1::vector ASC
-       LIMIT 35`, formattedVector);
-        // Re-rank and retrieve top chunks with introduction fallback
-        const topChunks = await this.retrieveRelevantChunks(question, matchedChunks);
-        // Filter relevant excerpts
-        const relevantExcerpts = topChunks
-            .map((chunk) => `[Source: ${chunk.title} (${chunk.documentType})] ${chunk.content}`)
-            .join("\n\n");
-        if (!relevantExcerpts) {
-            return "I couldn't find any relevant company policies in our database to answer your question. Please make sure policy documents are uploaded.";
-        }
-        // 3. Generate response using AI
-        const systemPrompt = `You are a helpful HR Policy Assistant. Answer the user's question accurately using ONLY the provided policy excerpts. If the excerpts do not contain the answer, say "I cannot find the answer in the current company policies. Please contact HR directly." Do not make up answers.
+       LIMIT 35`,
+      formattedVector,
+    );
+    // Re-rank and retrieve top chunks with introduction fallback
+    const topChunks = await this.retrieveRelevantChunks(
+      question,
+      matchedChunks,
+    );
+    // Filter relevant excerpts
+    const relevantExcerpts = topChunks
+      .map(
+        (chunk) =>
+          `[Source: ${chunk.title} (${chunk.documentType})] ${chunk.content}`,
+      )
+      .join("\n\n");
+    if (!relevantExcerpts) {
+      return "I couldn't find any relevant company policies in our database to answer your question. Please make sure policy documents are uploaded.";
+    }
+    // 3. Generate response using AI
+    const systemPrompt = `You are a helpful HR Policy Assistant. Answer the user's question accurately using ONLY the provided policy excerpts. If the excerpts do not contain the answer, say "I cannot find the answer in the current company policies. Please contact HR directly." Do not make up answers.
     
     Excerpts:
     ${relevantExcerpts}`;
-        try {
-            const completion = await client.chat.completions.create({
-                model: modelName,
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: question },
-                ],
-                temperature: 0.2,
-            });
-            return completion.choices[0].message.content || "No response generated.";
-        }
-        catch (error) {
-            throw new ApiError_1.default(http_status_codes_1.HTTP_STATUS_CODES.INTERNAL_SERVER_ERROR, `AI completion failed: ${error.message}`);
-        }
+    try {
+      const completion = await client.chat.completions.create({
+        model: modelName,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: question },
+        ],
+        temperature: 0.2,
+      });
+      return completion.choices[0].message.content || "No response generated.";
+    } catch (error) {
+      throw new ApiError_1.default(
+        http_status_codes_1.HTTP_STATUS_CODES.INTERNAL_SERVER_ERROR,
+        `AI completion failed: ${error.message}`,
+      );
     }
-    /**
-     * Save or update an employee's semantic profile
-     */
-    async saveEmployeeProfileEmbedding(userId, profile) {
-        await this.ensureVectorExtension();
-        const user = await prisma_1.default.user.findUnique({ where: { id: userId } });
-        if (!user) {
-            throw new ApiError_1.default(http_status_codes_1.HTTP_STATUS_CODES.NOT_FOUND, "User not found");
-        }
-        const name = `${user.firstName} ${user.lastName}`;
-        const skillsString = profile.skills.join(", ");
-        // Format descriptive profile string
-        const profileText = `Name: ${name}, Department: ${profile.department}, Skills: ${skillsString}, Experience: ${profile.experience}, Email: ${user.email}, Role: ${user.role}`;
-        const embedding = await this.generateEmbedding(profileText);
-        const formattedVector = `[${embedding.join(",")}]`;
-        // Check if embedding exists
-        const existing = await prisma_1.default.employeeEmbedding.findFirst({
-            where: { userId },
-        });
-        if (existing) {
-            await prisma_1.default.$executeRawUnsafe(`UPDATE "EmployeeEmbedding" SET content = $1, embedding = $2::vector WHERE id = $3`, profileText, formattedVector, existing.id);
-        }
-        else {
-            const id = crypto_1.default.randomUUID();
-            await prisma_1.default.$executeRawUnsafe(`INSERT INTO "EmployeeEmbedding" (id, "userId", content, embedding) VALUES ($1, $2, $3, $4::vector)`, id, userId, profileText, formattedVector);
-        }
-        return { success: true, profileText };
+  }
+  /**
+   * Save or update an employee's semantic profile
+   */
+  async saveEmployeeProfileEmbedding(userId, profile) {
+    await this.ensureVectorExtension();
+    const user = await prisma_1.default.user.findUnique({
+      where: { id: userId },
+    });
+    if (!user) {
+      throw new ApiError_1.default(
+        http_status_codes_1.HTTP_STATUS_CODES.NOT_FOUND,
+        "User not found",
+      );
     }
-    /**
-     * Search for employees semantically
-     */
-    async searchEmployeesSemantically(query, managerId) {
-        await this.ensureVectorExtension();
-        const queryEmbedding = await this.generateEmbedding(query);
-        const formattedVector = `[${queryEmbedding.join(",")}]`;
-        let queryStr = `
+    const name = `${user.firstName} ${user.lastName}`;
+    const skillsString = profile.skills.join(", ");
+    // Format descriptive profile string
+    const profileText = `Name: ${name}, Department: ${profile.department}, Skills: ${skillsString}, Experience: ${profile.experience}, Email: ${user.email}, Role: ${user.role}`;
+    const embedding = await this.generateEmbedding(profileText);
+    const formattedVector = `[${embedding.join(",")}]`;
+    // Check if embedding exists
+    const existing = await prisma_1.default.employeeEmbedding.findFirst({
+      where: { userId },
+    });
+    if (existing) {
+      await prisma_1.default.$executeRawUnsafe(
+        `UPDATE "EmployeeEmbedding" SET content = $1, embedding = $2::vector WHERE id = $3`,
+        profileText,
+        formattedVector,
+        existing.id,
+      );
+    } else {
+      const id = crypto_1.default.randomUUID();
+      await prisma_1.default.$executeRawUnsafe(
+        `INSERT INTO "EmployeeEmbedding" (id, "userId", content, embedding) VALUES ($1, $2, $3, $4::vector)`,
+        id,
+        userId,
+        profileText,
+        formattedVector,
+      );
+    }
+    return { success: true, profileText };
+  }
+  /**
+   * Search for employees semantically
+   */
+  async searchEmployeesSemantically(query, managerId) {
+    await this.ensureVectorExtension();
+    const queryEmbedding = await this.generateEmbedding(query);
+    const formattedVector = `[${queryEmbedding.join(",")}]`;
+    let queryStr = `
       SELECT e.id, e."userId", e.content, 1 - (e.embedding <=> $1::vector) AS similarity,
               u."firstName", u."lastName", u.email, u.role, u."isActive"
       FROM "EmployeeEmbedding" e
       JOIN "User" u ON e."userId" = u.id
     `;
-        const params = [formattedVector];
-        if (managerId) {
-            queryStr += ` WHERE u."managerId" = $2`;
-            params.push(managerId);
-        }
-        queryStr += `
+    const params = [formattedVector];
+    if (managerId) {
+      queryStr += ` WHERE u."managerId" = $2`;
+      params.push(managerId);
+    }
+    queryStr += `
       ORDER BY e.embedding <=> $1::vector ASC
       LIMIT 10
     `;
-        const matches = await prisma_1.default.$queryRawUnsafe(queryStr, ...params);
-        return matches;
-    }
-    /**
-     * Answer attendance-related natural language questions using AI tool/function calling
-     */
-    async askAttendanceQuestion(question, currentUser) {
-        const { client, modelName } = getAIClient();
-        // Define DB helper tools for the AI model
-        const tools = [
-            {
-                type: "function",
-                function: {
-                    name: "getEmployeesList",
-                    description: "Get a list of all employees in the system, including their id, name, role, department, active status.",
-                    parameters: { type: "object", properties: {} },
-                },
+    const matches = await prisma_1.default.$queryRawUnsafe(queryStr, ...params);
+    const settings = (0, aiSettings_1.getAISettings)();
+    const openAIKey = settings.openaiApiKey || process.env.OPENAI_API_KEY || "";
+    const isOpenAIActive = !!(
+      openAIKey && openAIKey !== "your-openai-api-key-here"
+    );
+    const threshold = isOpenAIActive ? 0.35 : 0.02;
+    const queryLower = query.toLowerCase();
+    const queryWords = queryLower.match(/\w+/g) || [];
+    const filteredMatches = matches.filter((m) => {
+      const profileTextLower = m.content.toLowerCase();
+      // 1. Enforce department matching if a department is mentioned in the query
+      const departments = [
+        "engineering",
+        "marketing",
+        "sales",
+        "hr",
+        "operations",
+        "finance",
+      ];
+      const queryDepartments = departments.filter((d) =>
+        queryLower.includes(d),
+      );
+      if (queryDepartments.length > 0) {
+        const hasMatchingDept = queryDepartments.some((d) =>
+          profileTextLower.includes(d),
+        );
+        if (!hasMatchingDept) return false;
+      }
+      // 2. Enforce experience years matching if specifically queried (e.g. "5 years", "2 yr")
+      const expMatch = queryLower.match(/(\d+)\s*(year|yr|experience)/);
+      if (expMatch) {
+        const targetYears = expMatch[1];
+        const numRegex = new RegExp(`\\b${targetYears}\\b`);
+        if (!numRegex.test(profileTextLower)) {
+          return false;
+        }
+      }
+      // 3. Threshold check
+      if (m.similarity >= threshold) return true;
+      // 4. Fallback: direct keyword match for high-relevance query terms (excluding stopwords)
+      const importantQueryWords = queryWords.filter(
+        (w) => !aiSettings_1.stopwords.has(w) && w.length > 1,
+      );
+      if (importantQueryWords.length > 0) {
+        return importantQueryWords.some((w) => profileTextLower.includes(w));
+      }
+      return false;
+    });
+    return filteredMatches;
+  }
+  /**
+   * Answer attendance-related natural language questions using AI tool/function calling
+   */
+  async askAttendanceQuestion(question, currentUser) {
+    const { client, modelName } = getAIClient();
+    // Define DB helper tools for the AI model
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "getEmployeesList",
+          description:
+            "Get a list of all employees in the system, including their id, name, role, department, active status.",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "getAttendanceRecords",
+          description:
+            "Get attendance details including checkIn, checkOut, workingHours, and overtimeHours. Filters by userId or date ranges.",
+          parameters: {
+            type: "object",
+            properties: {
+              userId: { type: "string", description: "Filter by user ID" },
+              startDate: {
+                type: "string",
+                description:
+                  "Start date filter (ISO format, e.g., '2026-06-01')",
+              },
+              endDate: {
+                type: "string",
+                description: "End date filter (ISO format, e.g., '2026-06-30')",
+              },
             },
-            {
-                type: "function",
-                function: {
-                    name: "getAttendanceRecords",
-                    description: "Get attendance details including checkIn, checkOut, workingHours, and overtimeHours. Filters by userId or date ranges.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            userId: { type: "string", description: "Filter by user ID" },
-                            startDate: { type: "string", description: "Start date filter (ISO format, e.g., '2026-06-01')" },
-                            endDate: { type: "string", description: "End date filter (ISO format, e.g., '2026-06-30')" },
-                        },
-                    },
-                },
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "searchCompanyPolicies",
+          description:
+            "Search or query the company policies, rules, benefits, guidelines, and HR documents for answers using natural language semantic search (RAG). Use this whenever the user asks about leaves, probation, benefits, or general HR rules.",
+          parameters: {
+            type: "object",
+            properties: {
+              query: {
+                type: "string",
+                description:
+                  "The search query or question describing the HR policy details to search for (e.g., 'vacation policy', 'probation period details', 'remote work rules').",
+              },
             },
-            {
-                type: "function",
-                function: {
-                    name: "searchCompanyPolicies",
-                    description: "Search or query the company policies, rules, benefits, guidelines, and HR documents for answers using natural language semantic search (RAG). Use this whenever the user asks about leaves, probation, benefits, or general HR rules.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            query: {
-                                type: "string",
-                                description: "The search query or question describing the HR policy details to search for (e.g., 'vacation policy', 'probation period details', 'remote work rules').",
-                            },
-                        },
-                        required: ["query"],
-                    },
-                },
+            required: ["query"],
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "searchEmployeeProfiles",
+          description:
+            "Search employee profiles (names, skills, experience, department) semantically using a natural language query. Use this tool when the user asks about specific employee skills, technology, experience, qualifications, or department roles.",
+          parameters: {
+            type: "object",
+            properties: {
+              query: {
+                type: "string",
+                description:
+                  "The skill, experience, or department description to search for (e.g. 'React developer', 'Python experience', '5 years in Marketing').",
+              },
             },
-            {
-                type: "function",
-                function: {
-                    name: "searchEmployeeProfiles",
-                    description: "Search employee profiles (names, skills, experience, department) semantically using a natural language query. Use this tool when the user asks about specific employee skills, technology, experience, qualifications, or department roles.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            query: {
-                                type: "string",
-                                description: "The skill, experience, or department description to search for (e.g. 'React developer', 'Python experience', '5 years in Marketing')."
-                            }
-                        },
-                        required: ["query"]
-                    }
-                }
-            }
-        ];
-        // Maintain context messages
-        const messages = [
-            {
-                role: "system",
-                content: `You are an AI HR, Attendance, and Policy Assistant. You answer questions about employee attendance, absences, overtime, skills, experience, and general company HR policies/rules by executing tool functions to query database records and company document repositories.
+            required: ["query"],
+          },
+        },
+      },
+    ];
+    // Maintain context messages
+    const messages = [
+      {
+        role: "system",
+        content: `You are an AI HR, Attendance, and Policy Assistant. You answer questions about employee attendance, absences, overtime, skills, experience, and general company HR policies/rules by executing tool functions to query database records and company document repositories.
         Note: The current date/time is ${new Date().toISOString()}. Use this to calculate monthly/weekly ranges (e.g., 'this month', 'last week').
         
         CRITICAL RULES FOR CALCULATIONS & LOGIC:
@@ -392,191 +520,212 @@ class AIService {
         5. Safety:
            - Once you have executed a tool and obtained relevant records or policy excerpts, formulate your final answer based strictly on the retrieved information.
            - Do not make up any numbers, dates, or HR policies. If data is not present, clearly state that.`,
-            },
-            { role: "user", content: question },
-        ];
-        try {
-            // 1. Initial Call
-            let response = await client.chat.completions.create({
-                model: modelName,
-                messages,
-                tools,
-                tool_choice: "auto",
-                temperature: 0.0,
+      },
+      { role: "user", content: question },
+    ];
+    try {
+      // 1. Initial Call
+      let response = await client.chat.completions.create({
+        model: modelName,
+        messages,
+        tools,
+        tool_choice: "auto",
+        temperature: 0.0,
+      });
+      let responseMessage = response.choices[0].message;
+      // 2. Loop while the model requests tool calls
+      let runIterations = 0;
+      while (responseMessage.tool_calls && runIterations < 5) {
+        runIterations++;
+        messages.push(responseMessage); // append assistant request to history
+        for (const toolCall of responseMessage.tool_calls) {
+          const functionName = toolCall.function.name;
+          const args = JSON.parse(toolCall.function.arguments);
+          let toolResult = "";
+          if (functionName === "getEmployeesList") {
+            const userWhere = {};
+            if (currentUser?.role === "MANAGER") {
+              userWhere.managerId = currentUser.id;
+            }
+            const users = await prisma_1.default.user.findMany({
+              where: userWhere,
+              include: { department: true, embeddings: true },
             });
-            let responseMessage = response.choices[0].message;
-            // 2. Loop while the model requests tool calls
-            let runIterations = 0;
-            while (responseMessage.tool_calls && runIterations < 5) {
-                runIterations++;
-                messages.push(responseMessage); // append assistant request to history
-                for (const toolCall of responseMessage.tool_calls) {
-                    const functionName = toolCall.function.name;
-                    const args = JSON.parse(toolCall.function.arguments);
-                    let toolResult = "";
-                    if (functionName === "getEmployeesList") {
-                        const userWhere = {};
-                        if (currentUser?.role === "MANAGER") {
-                            userWhere.managerId = currentUser.id;
-                        }
-                        const users = await prisma_1.default.user.findMany({
-                            where: userWhere,
-                            include: { department: true, embeddings: true },
-                        });
-                        toolResult = JSON.stringify(users.map((u) => ({
-                            id: u.id,
-                            name: `${u.firstName} ${u.lastName}`,
-                            email: u.email,
-                            role: u.role,
-                            department: u.department?.name || "None",
-                            isActive: u.isActive,
-                            profile: u.embeddings[0]?.content || "No profile details indexed",
-                        })));
-                    }
-                    else if (functionName === "getAttendanceRecords") {
-                        const whereClause = {};
-                        if (args.userId) {
-                            whereClause.userId = args.userId;
-                        }
-                        if (currentUser?.role === "MANAGER") {
-                            whereClause.user = {
-                                managerId: currentUser.id,
-                            };
-                        }
-                        if (args.startDate || args.endDate) {
-                            whereClause.checkIn = {};
-                            if (args.startDate) {
-                                const start = new Date(args.startDate);
-                                start.setUTCHours(0, 0, 0, 0);
-                                whereClause.checkIn.gte = start;
-                            }
-                            if (args.endDate) {
-                                const end = new Date(args.endDate);
-                                end.setUTCHours(23, 59, 59, 999);
-                                whereClause.checkIn.lte = end;
-                            }
-                        }
-                        const attendance = await prisma_1.default.attendance.findMany({
-                            where: whereClause,
-                            include: { user: true },
-                        });
-                        toolResult = JSON.stringify(attendance.map((a) => ({
-                            id: a.id,
-                            userId: a.userId,
-                            employeeName: `${a.user.firstName} ${a.user.lastName}`,
-                            checkIn: a.checkIn,
-                            checkOut: a.checkOut,
-                            workingHours: a.workingHours,
-                            overtimeHours: a.overtimeHours,
-                        })));
-                    }
-                    else if (functionName === "searchEmployeeProfiles") {
-                        try {
-                            const queryText = args.query;
-                            const managerId = currentUser?.role === "MANAGER" ? currentUser.id : undefined;
-                            const profiles = await this.searchEmployeesSemantically(queryText, managerId);
-                            toolResult = JSON.stringify(profiles.map((p) => ({
-                                userId: p.userId,
-                                employeeName: `${p.firstName} ${p.lastName}`,
-                                email: p.email,
-                                role: p.role,
-                                profileContent: p.content,
-                                similarity: p.similarity,
-                            })));
-                        }
-                        catch (err) {
-                            console.error("Error searching employee profiles:", err);
-                            toolResult = `Error searching employee profiles: ${err.message}`;
-                        }
-                    }
-                    else if (functionName === "searchCompanyPolicies" || functionName === "getHrPolicy") {
-                        const queryText = args.query || args.question || question;
-                        try {
-                            // 1. Embed query
-                            const queryEmbedding = await this.generateEmbedding(queryText);
-                            const formattedVector = `[${queryEmbedding.join(",")}]`;
-                            // 2. Query nearest chunks (retrieve more candidates for hybrid re-ranking)
-                            const matchedChunks = await prisma_1.default.$queryRawUnsafe(`SELECT c.content, d.title, d."documentType", 1 - (c.embedding <=> $1::vector) AS similarity
+            toolResult = JSON.stringify(
+              users.map((u) => ({
+                id: u.id,
+                name: `${u.firstName} ${u.lastName}`,
+                email: u.email,
+                role: u.role,
+                department: u.department?.name || "None",
+                isActive: u.isActive,
+                profile:
+                  u.embeddings[0]?.content || "No profile details indexed",
+              })),
+            );
+          } else if (functionName === "getAttendanceRecords") {
+            const whereClause = {};
+            if (args.userId) {
+              whereClause.userId = args.userId;
+            }
+            if (currentUser?.role === "MANAGER") {
+              whereClause.user = {
+                managerId: currentUser.id,
+              };
+            }
+            if (args.startDate || args.endDate) {
+              whereClause.checkIn = {};
+              if (args.startDate) {
+                const start = new Date(args.startDate);
+                start.setUTCHours(0, 0, 0, 0);
+                whereClause.checkIn.gte = start;
+              }
+              if (args.endDate) {
+                const end = new Date(args.endDate);
+                end.setUTCHours(23, 59, 59, 999);
+                whereClause.checkIn.lte = end;
+              }
+            }
+            const attendance = await prisma_1.default.attendance.findMany({
+              where: whereClause,
+              include: { user: true },
+            });
+            toolResult = JSON.stringify(
+              attendance.map((a) => ({
+                id: a.id,
+                userId: a.userId,
+                employeeName: `${a.user.firstName} ${a.user.lastName}`,
+                checkIn: a.checkIn,
+                checkOut: a.checkOut,
+                workingHours: a.workingHours,
+                overtimeHours: a.overtimeHours,
+              })),
+            );
+          } else if (functionName === "searchEmployeeProfiles") {
+            try {
+              const queryText = args.query;
+              const managerId =
+                currentUser?.role === "MANAGER" ? currentUser.id : undefined;
+              const profiles = await this.searchEmployeesSemantically(
+                queryText,
+                managerId,
+              );
+              toolResult = JSON.stringify(
+                profiles.map((p) => ({
+                  userId: p.userId,
+                  employeeName: `${p.firstName} ${p.lastName}`,
+                  email: p.email,
+                  role: p.role,
+                  profileContent: p.content,
+                  similarity: p.similarity,
+                })),
+              );
+            } catch (err) {
+              console.error("Error searching employee profiles:", err);
+              toolResult = `Error searching employee profiles: ${err.message}`;
+            }
+          } else if (
+            functionName === "searchCompanyPolicies" ||
+            functionName === "getHrPolicy"
+          ) {
+            const queryText = args.query || args.question || question;
+            try {
+              // 1. Embed query
+              const queryEmbedding = await this.generateEmbedding(queryText);
+              const formattedVector = `[${queryEmbedding.join(",")}]`;
+              // 2. Query nearest chunks (retrieve more candidates for hybrid re-ranking)
+              const matchedChunks = await prisma_1.default.$queryRawUnsafe(
+                `SELECT c.content, d.title, d."documentType", 1 - (c.embedding <=> $1::vector) AS similarity
                  FROM "DocumentChunk" c
                  JOIN "Document" d ON c."documentId" = d.id
                  ORDER BY c.embedding <=> $1::vector ASC
-                 LIMIT 35`, formattedVector);
-                            // Re-rank and retrieve top chunks with introduction fallback
-                            const topChunks = await this.retrieveRelevantChunks(queryText, matchedChunks);
-                            // Filter relevant excerpts
-                            const relevantExcerpts = topChunks
-                                .map((chunk) => `[Source Document: ${chunk.title} (${chunk.documentType})] ${chunk.content}`)
-                                .join("\n\n");
-                            toolResult = relevantExcerpts || "No relevant company policy documents found for this query in the database.";
-                        }
-                        catch (err) {
-                            console.error("Error searching company policies:", err);
-                            toolResult = `Error searching company policies: ${err.message}`;
-                        }
-                    }
-                    messages.push({
-                        role: "tool",
-                        tool_call_id: toolCall.id,
-                        name: functionName,
-                        content: toolResult,
-                    });
-                }
-                // Call LLM again with tool execution results
-                response = await client.chat.completions.create({
-                    model: modelName,
-                    messages,
-                    tools,
-                    tool_choice: "auto",
-                    temperature: 0.0,
-                });
-                responseMessage = response.choices[0].message;
+                 LIMIT 35`,
+                formattedVector,
+              );
+              // Re-rank and retrieve top chunks with introduction fallback
+              const topChunks = await this.retrieveRelevantChunks(
+                queryText,
+                matchedChunks,
+              );
+              // Filter relevant excerpts
+              const relevantExcerpts = topChunks
+                .map(
+                  (chunk) =>
+                    `[Source Document: ${chunk.title} (${chunk.documentType})] ${chunk.content}`,
+                )
+                .join("\n\n");
+              toolResult =
+                relevantExcerpts ||
+                "No relevant company policy documents found for this query in the database.";
+            } catch (err) {
+              console.error("Error searching company policies:", err);
+              toolResult = `Error searching company policies: ${err.message}`;
             }
-            return responseMessage.content || "Could not generate an answer.";
+          }
+          messages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            name: functionName,
+            content: toolResult,
+          });
         }
-        catch (error) {
-            console.error("AI Assistant failed. Details:");
-            if (error.response) {
-                console.error("Status:", error.response.status);
-                console.error("Data:", JSON.stringify(error.response.data, null, 2));
-            }
-            else {
-                console.error("Error object:", error);
-            }
-            if (error.failed_generation) {
-                console.error("failed_generation:", error.failed_generation);
-            }
-            throw new ApiError_1.default(http_status_codes_1.HTTP_STATUS_CODES.INTERNAL_SERVER_ERROR, `AI Assistant failed: ${error.message}`);
-        }
-    }
-    /**
-     * Get all uploaded documents
-     */
-    async getDocuments() {
-        return prisma_1.default.document.findMany({
-            include: {
-                uploadedBy: {
-                    select: {
-                        firstName: true,
-                        lastName: true,
-                    },
-                },
-            },
-            orderBy: {
-                createdAt: "desc",
-            },
+        // Call LLM again with tool execution results
+        response = await client.chat.completions.create({
+          model: modelName,
+          messages,
+          tools,
+          tool_choice: "auto",
+          temperature: 0.0,
         });
+        responseMessage = response.choices[0].message;
+      }
+      return responseMessage.content || "Could not generate an answer.";
+    } catch (error) {
+      console.error("AI Assistant failed. Details:");
+      if (error.response) {
+        console.error("Status:", error.response.status);
+        console.error("Data:", JSON.stringify(error.response.data, null, 2));
+      } else {
+        console.error("Error object:", error);
+      }
+      if (error.failed_generation) {
+        console.error("failed_generation:", error.failed_generation);
+      }
+      throw new ApiError_1.default(
+        http_status_codes_1.HTTP_STATUS_CODES.INTERNAL_SERVER_ERROR,
+        `AI Assistant failed: ${error.message}`,
+      );
     }
-    /**
-     * Delete an indexed document and its chunks
-     */
-    async deleteDocument(documentId) {
-        // Delete chunks first due to foreign key constraints
-        await prisma_1.default.documentChunk.deleteMany({
-            where: { documentId },
-        });
-        return prisma_1.default.document.delete({
-            where: { id: documentId },
-        });
-    }
+  }
+  /**
+   * Get all uploaded documents
+   */
+  async getDocuments() {
+    return prisma_1.default.document.findMany({
+      include: {
+        uploadedBy: {
+          select: {
+            firstName: true,
+            lastName: true,
+          },
+        },
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+  }
+  /**
+   * Delete an indexed document and its chunks
+   */
+  async deleteDocument(documentId) {
+    // Delete chunks first due to foreign key constraints
+    await prisma_1.default.documentChunk.deleteMany({
+      where: { documentId },
+    });
+    return prisma_1.default.document.delete({
+      where: { id: documentId },
+    });
+  }
 }
 exports.default = new AIService();

@@ -380,7 +380,47 @@ class AIService {
 
     const matches: any[] = await prisma.$queryRawUnsafe(queryStr, ...params);
 
-    return matches;
+    const settings = getAISettings();
+    const openAIKey = settings.openaiApiKey || process.env.OPENAI_API_KEY || "";
+    const isOpenAIActive = !!(openAIKey && openAIKey !== "your-openai-api-key-here");
+    
+    const threshold = isOpenAIActive ? 0.35 : 0.02;
+    const queryLower = query.toLowerCase();
+    const queryWords = queryLower.match(/\w+/g) || [];
+
+    const filteredMatches = matches.filter(m => {
+      const profileTextLower = m.content.toLowerCase();
+
+      // 1. Enforce department matching if a department is mentioned in the query
+      const departments = ["engineering", "marketing", "sales", "hr", "operations", "finance"];
+      const queryDepartments = departments.filter(d => queryLower.includes(d));
+      if (queryDepartments.length > 0) {
+        const hasMatchingDept = queryDepartments.some(d => profileTextLower.includes(d));
+        if (!hasMatchingDept) return false;
+      }
+
+      // 2. Enforce experience years matching if specifically queried (e.g. "5 years", "2 yr")
+      const expMatch = queryLower.match(/(\d+)\s*(year|yr|experience)/);
+      if (expMatch) {
+        const targetYears = expMatch[1];
+        const numRegex = new RegExp(`\\b${targetYears}\\b`);
+        if (!numRegex.test(profileTextLower)) {
+          return false;
+        }
+      }
+
+      // 3. Threshold check
+      if (m.similarity >= threshold) return true;
+
+      // 4. Fallback: direct keyword match for high-relevance query terms (excluding stopwords)
+      const importantQueryWords = queryWords.filter(w => !stopwords.has(w) && w.length > 1);
+      if (importantQueryWords.length > 0) {
+        return importantQueryWords.some(w => profileTextLower.includes(w));
+      }
+      return false;
+    });
+
+    return filteredMatches;
   }
 
   /**
