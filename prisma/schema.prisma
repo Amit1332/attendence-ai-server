@@ -1,0 +1,163 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+enum Role {
+  ADMIN
+  MANAGER
+  STAFF
+}
+
+enum AttendanceStatus {
+  CHECKED_IN
+  CHECKED_OUT
+}
+
+enum DocumentType {
+  EMPLOYEE_HANDBOOK
+  HR_POLICY
+  LEAVE_POLICY
+  ATTENDANCE_POLICY
+  COMPANY_POLICY
+  OTHER
+}
+
+model User {
+
+  id            String   @id @default(cuid())
+
+  firstName     String
+  lastName      String
+
+  email         String   @unique
+  password      String
+
+  phone         String?
+
+  role          Role
+
+  departmentId  String?
+  department    Department? @relation(fields: [departmentId], references: [id])
+
+  managerId     String?
+  manager       User? @relation("ManagerStaff", fields: [managerId], references: [id])
+
+  staffs        User[] @relation("ManagerStaff")
+
+  isActive      Boolean @default(true)
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  attendances   Attendance[]
+  refreshTokens RefreshToken[]
+  embeddings    EmployeeEmbedding[]
+
+  uploadedDocuments Document[]   // ✅ Add this
+}
+
+model Department {
+  id        String @id @default(cuid())
+
+  name      String @unique
+
+  users     User[]
+
+  createdAt DateTime @default(now())
+}
+
+
+model Attendance {
+
+  id          String @id @default(cuid())
+
+  userId      String
+
+  user        User @relation(fields:[userId], references:[id])
+
+  checkIn     DateTime
+
+  checkOut    DateTime?
+
+  workingHours Float?
+
+  overtimeHours Float?
+
+  createdAt DateTime @default(now())
+}
+
+
+model RefreshToken {
+
+  id String @id @default(cuid())
+
+  token String
+
+  expiresAt DateTime
+
+  userId String
+
+  user User @relation(fields:[userId], references:[id])
+
+  createdAt DateTime @default(now())
+}
+
+
+model Document {
+
+  id String @id @default(cuid())
+
+  title String
+
+  fileName String
+
+  documentType DocumentType
+
+  uploadedById String
+
+  uploadedBy User @relation(fields:[uploadedById], references:[id])
+
+  chunks DocumentChunk[]
+
+  createdAt DateTime @default(now())
+}
+
+
+model DocumentChunk {
+
+  id String @id @default(cuid())
+
+  documentId String
+
+  document Document @relation(fields:[documentId], references:[id])
+
+  content String
+
+  embedding Unsupported("vector")
+
+  createdAt DateTime @default(now())
+}
+
+
+model EmployeeEmbedding {
+
+  id String @id @default(cuid())
+
+  userId String
+
+  user User @relation(fields:[userId], references:[id])
+
+  content String
+
+  embedding Unsupported("vector")
+}
+
+model SystemSetting {
+  id    String @id @default(cuid())
+  key   String @unique
+  value String
+}
