@@ -516,7 +516,11 @@ class AIService {
            - Query 'getAttendanceRecords' for the period. Filter and list employees who have 'overtimeHours > 0', summarizing their total hours.
         5. Safety:
            - Once you have executed a tool and obtained relevant records or policy excerpts, formulate your final answer based strictly on the retrieved information.
-           - Do not make up any numbers, dates, or HR policies. If data is not present, clearly state that.`,
+           - Do not make up any numbers, dates, or HR policies. If data is not present, clearly state that.
+        6. Formatting rule for tool/function calls:
+           - When you decide to call a tool/function, you must generate ONLY the tool call structure.
+           - CRITICAL: Do NOT write any conversational explanation, preamble, thoughts, markdown, or comments before or after the tool call. Outputting text alongside the tool call will cause a system crash.
+           - You may write a conversational explanation ONLY in your final response after receiving the tool's result.`,
       },
       { role: "user", content: question },
     ];
@@ -686,6 +690,190 @@ class AIService {
       if (error.failed_generation) {
         console.error("failed_generation:", error.failed_generation);
       }
+
+      // Check if it's a tool-calling / function-calling 400 error from Groq/OpenAI
+      const errStr = String(error.message || error);
+      const isToolError = errStr.includes("Failed to call a function") ||
+                          errStr.includes("failed_generation") ||
+                          error.status === 400 ||
+                          error.response?.status === 400;
+
+      if (isToolError) {
+        const queryLower = question.toLowerCase();
+        const isPolicyQuery = /policy|policies|leave|leaves|holiday|holidays|rule|rules|handbook|conduct|dress|grooming|welfare|benefit|benefits|compensation|sick|casual|privilege|maternity|paternity|c-off|off|hr/.test(queryLower);
+
+        if (isPolicyQuery) {
+          console.log(`Tool calling failed. Query "${question}" identified as policy query. Falling back to askPolicyQuestion.`);
+          try {
+            return await this.askPolicyQuestion(question);
+          } catch (policyErr: any) {
+            console.error("Policy fallback also failed:", policyErr);
+          }
+        }
+
+        // Retry once for attendance/employee queries with strict system instructions
+        console.log(`Tool calling failed. Retrying query "${question}" with strict system instruction.`);
+        try {
+          const retryMessages = [
+            ...messages.filter(m => m.role !== "system"),
+            {
+              role: "system",
+              content: `You are an AI HR and Attendance Assistant. You must answer the user query by calling one of the available functions.
+              CRITICAL: When you need to call a tool/function, you MUST ONLY output the tool call. Do NOT output any preamble, thoughts, explanations, markdown, or conversational text. Generate ONLY the JSON tool call block.
+              
+              Note: The current date/time is ${new Date().toISOString()}.`
+            }
+          ];
+
+          let retryResponse = await client.chat.completions.create({
+            model: modelName,
+            messages: retryMessages,
+            tools,
+            tool_choice: "auto",
+            temperature: 0.0,
+          });
+
+          let retryResponseMessage = retryResponse.choices[0].message;
+          let retryIterations = 0;
+
+          while (retryResponseMessage.tool_calls && retryIterations < 5) {
+            retryIterations++;
+            retryMessages.push(retryResponseMessage);
+
+            for (const toolCall of retryResponseMessage.tool_calls) {
+              const functionName = (toolCall as any).function.name;
+              const args = JSON.parse((toolCall as any).function.arguments);
+              let toolResult = "";
+
+              if (functionName === "getEmployeesList") {
+                const userWhere: any = {};
+                if (currentUser?.role === "MANAGER") {
+                  userWhere.managerId = currentUser.id;
+                }
+                const users = await prisma.user.findMany({
+                  where: userWhere,
+                  include: { department: true, embeddings: true },
+                });
+                toolResult = JSON.stringify(
+                  users.map((u) => ({
+                    id: u.id,
+                    name: `${u.firstName} ${u.lastName}`,
+                    email: u.email,
+                    role: u.role,
+                    department: u.department?.name || "None",
+                    isActive: u.isActive,
+                    profile: u.embeddings[0]?.content || "No profile details indexed",
+                  }))
+                );
+              } else if (functionName === "getAttendanceRecords") {
+                const whereClause: any = {};
+                if (args.userId) {
+                  whereClause.userId = args.userId;
+                }
+                if (currentUser?.role === "MANAGER") {
+                  whereClause.user = {
+                    managerId: currentUser.id,
+                  };
+                }
+                if (args.startDate || args.endDate) {
+                  whereClause.checkIn = {};
+                  if (args.startDate) {
+                    const start = new Date(args.startDate);
+                    start.setUTCHours(0, 0, 0, 0);
+                    whereClause.checkIn.gte = start;
+                  }
+                  if (args.endDate) {
+                    const end = new Date(args.endDate);
+                    end.setUTCHours(23, 59, 59, 999);
+                    whereClause.checkIn.lte = end;
+                  }
+                }
+
+                const attendance = await prisma.attendance.findMany({
+                  where: whereClause,
+                  include: { user: true },
+                });
+
+                toolResult = JSON.stringify(
+                  attendance.map((a) => ({
+                    id: a.id,
+                    userId: a.userId,
+                    employeeName: `${a.user.firstName} ${a.user.lastName}`,
+                    checkIn: a.checkIn,
+                    checkOut: a.checkOut,
+                    workingHours: a.workingHours,
+                    overtimeHours: a.overtimeHours,
+                  }))
+                );
+              } else if (functionName === "searchEmployeeProfiles") {
+                try {
+                  const queryText = args.query;
+                  const managerId = currentUser?.role === "MANAGER" ? currentUser.id : undefined;
+                  const profiles = await this.searchEmployeesSemantically(queryText, managerId);
+                  toolResult = JSON.stringify(
+                    profiles.map((p) => ({
+                      userId: p.userId,
+                      employeeName: `${p.firstName} ${p.lastName}`,
+                      email: p.email,
+                      role: p.role,
+                      profileContent: p.content,
+                      similarity: p.similarity,
+                    }))
+                  );
+                } catch (err: any) {
+                  console.error("Error searching employee profiles during retry:", err);
+                  toolResult = `Error searching employee profiles: ${err.message}`;
+                }
+              } else if (functionName === "searchCompanyPolicies" || functionName === "getHrPolicy") {
+                const queryText = args.query || args.question || question;
+                try {
+                  const queryEmbedding = await this.generateEmbedding(queryText);
+                  const formattedVector = `[${queryEmbedding.join(",")}]`;
+                  const matchedChunks: any[] = await prisma.$queryRawUnsafe(
+                    `SELECT c.content, d.title, d."documentType", 1 - (c.embedding <=> $1::vector) AS similarity
+                     FROM "DocumentChunk" c
+                     JOIN "Document" d ON c."documentId" = d.id
+                     ORDER BY c.embedding <=> $1::vector ASC
+                     LIMIT 35`,
+                    formattedVector
+                  );
+                  const topChunks = await this.retrieveRelevantChunks(queryText, matchedChunks);
+                  const relevantExcerpts = topChunks
+                    .map((chunk) => `[Source Document: ${chunk.title} (${chunk.documentType})] ${chunk.content}`)
+                    .join("\n\n");
+                  toolResult = relevantExcerpts || "No relevant company policy documents found for this query in the database.";
+                } catch (err: any) {
+                  console.error("Error searching company policies during retry:", err);
+                  toolResult = `Error searching company policies: ${err.message}`;
+                }
+              }
+
+              retryMessages.push({
+                role: "tool",
+                tool_call_id: toolCall.id,
+                name: functionName,
+                content: toolResult,
+              });
+            }
+
+            retryResponse = await client.chat.completions.create({
+              model: modelName,
+              messages: retryMessages,
+              tools,
+              tool_choice: "auto",
+              temperature: 0.0,
+            });
+            retryResponseMessage = retryResponse.choices[0].message;
+          }
+
+          if (retryResponseMessage.content) {
+            return retryResponseMessage.content;
+          }
+        } catch (retryErr: any) {
+          console.error("Strict tool retry also failed:", retryErr);
+        }
+      }
+
       throw new ApiError(
         HTTP_STATUS_CODES.INTERNAL_SERVER_ERROR,
         `AI Assistant failed: ${error.message}`
